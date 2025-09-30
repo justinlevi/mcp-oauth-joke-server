@@ -355,12 +355,69 @@ The [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector) is the
 npx @modelcontextprotocol/inspector uv --directory . run joke-server
 ```
 
+### Testing with OAuth Authentication
+
+To test the OAuth flow with MCP Inspector, you need to configure the authentication settings in the Inspector's Auth tab.
+
+#### 1. Start the required services:
+```bash
+# Start Keycloak and PostgreSQL
+docker-compose up -d
+
+# Configure Keycloak (creates realm, clients, users)
+python scripts/configure-keycloak.py
+
+# Start the HTTP server with OAuth enabled
+export KEYCLOAK_URL=http://localhost:8080
+export KEYCLOAK_REALM=mcp
+export KEYCLOAK_CLIENT_ID=mcp-joke-server
+export KEYCLOAK_CLIENT_SECRET=$(cat /tmp/client_secret.txt)
+export RESOURCE_SERVER_URL=http://localhost:8000
+export ALLOW_AUTH_BYPASS=false
+
+uv run python -m joke_mcp_server.http_server
+```
+
+#### 2. Configure MCP Inspector Authentication:
+
+In the MCP Inspector UI, go to the **Auth** tab and configure the following settings:
+
+**OAuth 2.0 Flow Settings:**
+- **Client ID**: `mcp-inspector`
+- **Redirect URL**: `http://localhost:6274/oauth/callback`
+- **Scope**: `openid profile email tools:mom_jokes`
+
+**Authorization Endpoints:**
+The Inspector will auto-discover these from the `/.well-known/oauth-protected-resource` endpoint, but for reference:
+- **Authorization Server**: `http://localhost:8080/realms/mcp`
+- **Token Endpoint**: `http://localhost:8080/realms/mcp/protocol/openid-connect/token`
+- **Authorization Endpoint**: `http://localhost:8080/realms/mcp/protocol/openid-connect/auth`
+
+**Test User Credentials** (created by configure-keycloak.py):
+- **Username**: `testuser`
+- **Password**: `testpass`
+
+#### 3. Test the Authorization Flow:
+
+1. **Test Public Tool (No Auth Required)**:
+   - Call `get_dad_joke` - should work without authentication
+
+2. **Test Protected Tool (Auth Required)**:
+   - Call `get_mom_joke` without authentication - should return 401
+   - Click "Authenticate" in the Inspector
+   - Log in with test credentials
+   - Call `get_mom_joke` again - should now succeed
+
 ### What to test:
 
 1. **Tool Discovery**: Verify both tools appear in the tools list
-2. **Tool Execution**: Call each tool and verify joke responses
-3. **Error Handling**: Test with invalid tool names
-4. **Protocol Compliance**: Verify MCP protocol messages
+2. **Public Tool Access**: Call `get_dad_joke` without authentication
+3. **Protected Tool Access**: Call `get_mom_joke` - verify 401 response
+4. **OAuth Flow**: Complete authentication flow via Inspector UI
+5. **Authenticated Access**: Call `get_mom_joke` with valid token
+6. **Token Expiration**: Wait for token to expire and verify re-authentication
+7. **Error Handling**: Test with invalid tool names
+8. **Protocol Compliance**: Verify MCP protocol messages
 
 ## MCP Protocol Implementation
 
