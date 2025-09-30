@@ -84,9 +84,41 @@ def create_www_authenticate_header() -> str:
     return f'Bearer resource_metadata="{metadata_url}"'
 
 
+async def get_jwks() -> Dict[str, Any]:
+    """
+    Fetch JWKS (JSON Web Key Set) from Keycloak.
+
+    Returns:
+        JWKS dictionary containing public keys
+
+    Raises:
+        AuthorizationError if JWKS cannot be fetched
+    """
+    jwks_url = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(jwks_url, timeout=5.0)
+
+            if response.status_code != 200:
+                raise AuthorizationError("Failed to fetch JWKS")
+
+            return response.json()
+
+    except httpx.RequestError as e:
+        logger.error(f"Error fetching JWKS from Keycloak: {e}")
+        if os.getenv("ALLOW_AUTH_BYPASS", "false").lower() == "true":
+            logger.warning("Auth bypass enabled - skipping JWKS fetch")
+            return {"keys": []}
+        raise AuthorizationError("Authentication service unavailable")
+
+
 async def validate_token(token: str) -> Dict[str, Any]:
     """
-    Validate OAuth token with Keycloak.
+    Validate OAuth token using JWT signature verification.
+
+    This approach validates tokens locally using JWKS instead of introspection,
+    which is more efficient and doesn't require special Keycloak permissions.
 
     Args:
         token: The access token to validate
@@ -97,59 +129,77 @@ async def validate_token(token: str) -> Dict[str, Any]:
     Raises:
         AuthorizationError if token is invalid
     """
-    # Keycloak introspection endpoint
-    introspection_url = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token/introspect"
-
-    # Get client credentials from environment
-    client_id = os.getenv("KEYCLOAK_CLIENT_ID", "mcp-joke-server")
-    client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET", "")
-
     try:
-        async with httpx.AsyncClient() as client:
-            # Use client credentials for introspection
-            response = await client.post(
-                introspection_url,
-                data={
-                    "token": token,
-                    "token_type_hint": "access_token",
-                    "client_id": client_id,
-                    "client_secret": client_secret
-                }
-            )
+        # Get JWKS for signature verification
+        jwks = await get_jwks()
 
-            if response.status_code != 200:
-                raise AuthorizationError("Token validation failed")
+        logger.info(f"Validating token (length: {len(token)}, preview: {token[:50]}...)")
 
-            token_info = response.json()
+        # Decode JWT header to get key ID
+        unverified_header = jwt.get_unverified_header(token)
+        kid = unverified_header.get("kid")
+        logger.info(f"Token key ID: {kid}")
 
-            # Check if token is active
-            if not token_info.get("active", False):
-                raise AuthorizationError("Token is not active")
+        if not kid:
+            raise AuthorizationError("Token missing key ID")
 
-            # Validate audience (resource server should be in aud claim)
-            audience = token_info.get("aud", [])
-            if isinstance(audience, str):
-                audience = [audience]
+        # Find the matching key in JWKS
+        key = None
+        for jwk in jwks.get("keys", []):
+            if jwk.get("kid") == kid:
+                key = jwk
+                break
 
-            # Check if this resource server is in the audience
-            # In production, validate against actual resource identifier
-            if RESOURCE_SERVER_URL not in audience and "mcp-joke-server" not in audience:
-                logger.warning(f"Token audience mismatch. Expected {RESOURCE_SERVER_URL}, got {audience}")
-                # For development, we'll be lenient
-                # raise AuthorizationError("Token audience mismatch")
+        if not key:
+            raise AuthorizationError("No matching key found in JWKS")
 
-            return token_info
+        # Verify and decode the token
+        # The jose library handles RSA signature verification using the JWK
+        issuer = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}"
 
-    except httpx.RequestError as e:
-        logger.error(f"Error connecting to Keycloak: {e}")
-        # In development, allow bypass if Keycloak is not available
-        if os.getenv("ALLOW_AUTH_BYPASS", "false").lower() == "true":
-            logger.warning("Auth bypass enabled - skipping token validation")
-            return {"active": True, "sub": "dev-user"}
-        raise AuthorizationError("Authentication service unavailable")
+        claims = jwt.decode(
+            token,
+            key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            options={
+                "verify_signature": True,
+                "verify_aud": False,  # We'll validate audience manually
+                "verify_iat": True,
+                "verify_exp": True,
+                "verify_nbf": True,
+                "verify_iss": True,
+            }
+        )
+
+        # Validate audience if present
+        audience = claims.get("aud", [])
+        if isinstance(audience, str):
+            audience = [audience]
+
+        # Log for debugging but don't fail on audience mismatch
+        # In a production setup, you'd want stricter validation
+        if audience and RESOURCE_SERVER_URL not in audience and "account" not in audience:
+            logger.warning(f"Token audience: {audience}. Expected {RESOURCE_SERVER_URL}")
+
+        logger.info(f"Token validated successfully for subject: {claims.get('sub')}")
+        return claims
+
+    except jwt.ExpiredSignatureError:
+        logger.warning("Token has expired")
+        raise AuthorizationError("Token has expired")
+    except jwt.JWTClaimsError as e:
+        logger.warning(f"Token claims validation failed: {e}")
+        raise AuthorizationError("Invalid token claims")
     except JWTError as e:
         logger.error(f"JWT validation error: {e}")
         raise AuthorizationError("Invalid token")
+    except Exception as e:
+        logger.error(f"Unexpected error validating token: {e}")
+        if os.getenv("ALLOW_AUTH_BYPASS", "false").lower() == "true":
+            logger.warning("Auth bypass enabled - skipping token validation")
+            return {"sub": "dev-user", "scope": "tools:mom_jokes"}
+        raise AuthorizationError("Token validation failed")
 
 
 def requires_authorization(tool_name: str) -> bool:
@@ -197,17 +247,18 @@ async def check_tool_authorization(
         raise AuthorizationError("Authorization required", headers=headers)
 
     # Validate the token
-    token_info = await validate_token(credentials.credentials)
+    # Strip any whitespace that might have been added
+    token = credentials.credentials.strip()
+    logger.info(f"Received token for validation (type: {type(token)}, length: {len(token)})")
+    token_info = await validate_token(token)
 
     # Check if token has required scope
     scopes = token_info.get("scope", "").split()
     required_scope = "tools:mom_jokes"
 
-    # For development, be lenient about scopes
     if required_scope not in scopes:
         logger.warning(f"Token missing required scope {required_scope}. Has scopes: {scopes}")
-        # In production, uncomment this:
-        # raise AuthorizationError("Insufficient scope")
+        raise AuthorizationError("Insufficient scope")
 
     return token_info
 

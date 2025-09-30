@@ -6,11 +6,15 @@ enabling web-based clients to interact with the joke generation tools.
 """
 
 import sys
+import logging
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import uvicorn
+
+logger = logging.getLogger(__name__)
 from fastapi import FastAPI, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -58,6 +62,30 @@ app = FastAPI(
     description="MCP server providing dad and mom joke generation via HTTP/SSE",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+# Configure CORS to allow MCP Inspector and other clients
+# In production, be more restrictive with allowed origins
+import os
+
+cors_origins = [
+    "http://localhost:6274",    # MCP Inspector default port
+    "http://localhost:3000",    # Common dev server port
+    "http://127.0.0.1:6274",    # MCP Inspector on 127.0.0.1
+    "http://127.0.0.1:3000",    # Dev server on 127.0.0.1
+]
+
+# Allow all origins in development mode
+if os.getenv("ALLOW_AUTH_BYPASS", "false").lower() == "true":
+    cors_origins = ["*"]  # Allow all origins in dev mode
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods including OPTIONS for preflight
+    allow_headers=["*"],  # Allow all headers including Authorization
+    expose_headers=["WWW-Authenticate", "Content-Type"],  # Expose necessary headers
 )
 
 
@@ -169,25 +197,48 @@ async def _handle_mcp_message(
 
     if method == "tools/list":
         tools = await list_tools()
-        # Add authorization requirements to tool metadata
-        tools_with_auth = []
+        logger.info(f"tools/list called with credentials: {bool(credentials)}")
+        # Filter tools based on authorization status
+        accessible_tools = []
         for tool in tools:
-            tool_dict = {
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.inputSchema,
-            }
-            # Add authorization requirement indicator
+            # Check if tool requires authorization
             if requires_authorization(tool.name):
-                tool_dict["requiresAuthorization"] = True
-            tools_with_auth.append(tool_dict)
+                # Only include protected tools if user is authenticated
+                if credentials:
+                    try:
+                        # Validate token to check if user has access
+                        # This will check the token and scopes
+                        logger.info(f"Checking authorization for protected tool: {tool.name}")
+                        await check_tool_authorization(tool.name, credentials)
+                        # User is authorized, include the tool
+                        logger.info(f"User authorized for tool: {tool.name}")
+                        accessible_tools.append({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "inputSchema": tool.inputSchema,
+                        })
+                    except AuthorizationError as e:
+                        # User is authenticated but lacks required scope
+                        # Don't include this tool
+                        logger.info(f"Authorization failed for {tool.name}: {e}")
+                        pass
+                else:
+                    logger.info(f"No credentials provided, skipping protected tool: {tool.name}")
+                # If no credentials, don't include protected tools
+            else:
+                # Public tool, always include
+                accessible_tools.append({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": tool.inputSchema,
+                })
 
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
                 "id": message.get("id"),
                 "result": {
-                    "tools": tools_with_auth
+                    "tools": accessible_tools
                 },
             }
         )
