@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "joke-server": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/Users/jwinter/projects/mcp/joke-mcp-server",
+        "run",
+        "joke-server"
+      ],
+      "transport": "stdio"
+    }
+  }
+}
