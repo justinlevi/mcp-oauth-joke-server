@@ -111,9 +111,10 @@ async def test_call_dad_joke_tool():
 
 @pytest.mark.asyncio
 async def test_call_mom_joke_tool():
-    """Test calling the mom joke tool via MCP protocol."""
+    """Test calling the mom joke tool requires authorization."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Without authorization, mom joke should return 401
         message = {
             "jsonrpc": "2.0",
             "id": 4,
@@ -121,15 +122,24 @@ async def test_call_mom_joke_tool():
             "params": {"name": "get_mom_joke", "arguments": {}},
         }
         response = await client.post("/mcp", json=message)
-        assert response.status_code == 200
-        data = response.json()
-        assert data["jsonrpc"] == "2.0"
-        assert data["id"] == 4
-        assert "result" in data
-        content = data["result"]["content"]
-        assert len(content) > 0
-        assert content[0]["type"] == "text"
-        assert len(content[0]["text"]) > 0
+
+        # Check if auth is bypassed for testing
+        import os
+        if os.getenv("ALLOW_AUTH_BYPASS") == "true":
+            # In test mode with auth bypass, should work
+            assert response.status_code == 200
+            data = response.json()
+            assert data["jsonrpc"] == "2.0"
+            assert data["id"] == 4
+            assert "result" in data
+            content = data["result"]["content"]
+            assert len(content) > 0
+            assert content[0]["type"] == "text"
+            assert len(content[0]["text"]) > 0
+        else:
+            # In production mode, should require auth
+            assert response.status_code == 401
+            assert "WWW-Authenticate" in response.headers
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 
 - 🎭 **Two Joke Tools**: Get random dad jokes or mom jokes on demand
 - 🔌 **Multiple Transports**: Supports both stdio and HTTP/SSE transports
+- 🔐 **OAuth 2.1 Authorization**: Selective tool protection with RFC 9728 compliance
 - ✅ **Type Safe**: Fully typed Python code with comprehensive type hints
 - 🧪 **Well Tested**: Comprehensive test coverage for core functionality
 - 📦 **Modern Stack**: Built with uv, FastAPI, and the official MCP SDK
@@ -120,6 +121,103 @@ curl -X POST http://127.0.0.1:8000/mcp \
   }'
 ```
 
+## OAuth 2.1 Authorization
+
+The MCP Joke Server implements OAuth 2.1 authorization following RFC 9728 (Protected Resource Metadata). This allows selective protection of tools - dad jokes are public, while mom jokes require authentication.
+
+### Quick Start with OAuth
+
+1. **Start Keycloak and PostgreSQL:**
+```bash
+docker-compose up -d
+```
+
+2. **Configure Keycloak automatically:**
+```bash
+python scripts/configure-keycloak.py
+```
+
+3. **Start the server with OAuth enabled:**
+```bash
+export KEYCLOAK_URL=http://localhost:8080
+export KEYCLOAK_REALM=mcp
+export KEYCLOAK_CLIENT_ID=mcp-joke-server
+export KEYCLOAK_CLIENT_SECRET=<get-from-keycloak-admin>
+export RESOURCE_SERVER_URL=http://localhost:8000
+
+uv run python -m joke_mcp_server.http_server
+```
+
+### Authorization Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant MCP Server
+    participant Keycloak
+
+    Client->>MCP Server: Call get_mom_joke (no token)
+    MCP Server-->>Client: 401 + WWW-Authenticate header
+
+    Client->>MCP Server: GET /.well-known/oauth-protected-resource
+    MCP Server-->>Client: Authorization server metadata
+
+    Client->>Keycloak: Request access token
+    Keycloak-->>Client: Access token with tools:mom_jokes scope
+
+    Client->>MCP Server: Call get_mom_joke (with token)
+    MCP Server->>Keycloak: Introspect token
+    Keycloak-->>MCP Server: Token valid + claims
+    MCP Server-->>Client: Mom joke response
+```
+
+### Protected Resource Metadata
+
+The server exposes OAuth metadata at `/.well-known/oauth-protected-resource`:
+
+```json
+{
+  "resource": "http://localhost:8000",
+  "authorization_servers": ["http://localhost:8080/realms/mcp"],
+  "scopes_supported": ["tools:mom_jokes"],
+  "bearer_methods_supported": ["header"],
+  "resource_name": "MCP Joke Server"
+}
+```
+
+### Testing OAuth Flow
+
+1. **Get an access token:**
+```bash
+curl -X POST http://localhost:8080/realms/mcp/protocol/openid-connect/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=password&client_id=mcp-inspector&username=testuser&password=testpass&scope=tools:mom_jokes'
+```
+
+2. **Call protected tool with token:**
+```bash
+curl -X POST http://localhost:8000/mcp \
+  -H "Authorization: Bearer <ACCESS_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_mom_joke","arguments":{}}}'
+```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `KEYCLOAK_URL` | Keycloak server URL | `http://localhost:8080` |
+| `KEYCLOAK_REALM` | Keycloak realm name | `mcp` |
+| `KEYCLOAK_CLIENT_ID` | Client ID for introspection | `mcp-joke-server` |
+| `KEYCLOAK_CLIENT_SECRET` | Client secret for introspection | Required |
+| `RESOURCE_SERVER_URL` | This server's URL | `http://localhost:8000` |
+| `ALLOW_AUTH_BYPASS` | Skip auth for development | `false` |
+
+### Tool Protection Status
+
+- 🔓 **get_dad_joke**: Public - no authentication required
+- 🔒 **get_mom_joke**: Protected - requires `tools:mom_jokes` scope
+
 ## Available Tools
 
 ### 1. get_dad_joke
@@ -169,7 +267,8 @@ mcp/
 │       ├── __init__.py         # Package initialization
 │       ├── jokes.py            # Joke generation logic
 │       ├── server.py           # Stdio MCP server
-│       └── http_server.py      # HTTP/SSE MCP server
+│       ├── http_server.py      # HTTP/SSE MCP server
+│       └── auth.py             # OAuth 2.1 authorization
 ├── tests/
 │   ├── __init__.py
 │   ├── test_jokes.py           # Joke generator tests

@@ -7,16 +7,24 @@ enabling web-based clients to interact with the joke generation tools.
 
 import sys
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
 from .jokes import JokeGenerator
+from .auth import (
+    get_protected_resource_metadata,
+    check_tool_authorization,
+    requires_authorization,
+    AuthorizationError,
+    bearer_scheme
+)
 
 
 # Initialize joke generator
@@ -130,14 +138,29 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/.well-known/oauth-protected-resource")
+async def protected_resource_metadata():
+    """
+    Protected Resource Metadata endpoint as per RFC 9728.
+
+    Returns metadata about this resource server and its authorization requirements.
+    """
+    metadata = get_protected_resource_metadata()
+    return JSONResponse(content=metadata.model_dump(exclude_none=True))
 
 
-async def _handle_mcp_message(message: dict) -> JSONResponse:
+
+
+async def _handle_mcp_message(
+    message: dict,
+    credentials: Optional[HTTPAuthorizationCredentials] = None
+) -> JSONResponse:
     """
     Internal handler for MCP protocol messages.
 
     Args:
         message: The JSON-RPC message to handle
+        credentials: Optional bearer token credentials
 
     Returns:
         JSONResponse with the result or error
@@ -146,19 +169,25 @@ async def _handle_mcp_message(message: dict) -> JSONResponse:
 
     if method == "tools/list":
         tools = await list_tools()
+        # Add authorization requirements to tool metadata
+        tools_with_auth = []
+        for tool in tools:
+            tool_dict = {
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.inputSchema,
+            }
+            # Add authorization requirement indicator
+            if requires_authorization(tool.name):
+                tool_dict["requiresAuthorization"] = True
+            tools_with_auth.append(tool_dict)
+
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
                 "id": message.get("id"),
                 "result": {
-                    "tools": [
-                        {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "inputSchema": tool.inputSchema,
-                        }
-                        for tool in tools
-                    ]
+                    "tools": tools_with_auth
                 },
             }
         )
@@ -167,6 +196,23 @@ async def _handle_mcp_message(message: dict) -> JSONResponse:
         params = message.get("params", {})
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
+
+        # Check authorization for protected tools
+        try:
+            await check_tool_authorization(tool_name, credentials)
+        except AuthorizationError as e:
+            return JSONResponse(
+                content={
+                    "jsonrpc": "2.0",
+                    "id": message.get("id"),
+                    "error": {
+                        "code": -32603,
+                        "message": str(e.detail),
+                    },
+                },
+                status_code=e.status_code,
+                headers=e.headers
+            )
 
         result = await call_tool(tool_name, arguments)
 
@@ -211,7 +257,10 @@ async def _handle_mcp_message(message: dict) -> JSONResponse:
 
 
 @app.post("/mcp")
-async def handle_mcp_endpoint(request: Request):
+async def handle_mcp_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)
+):
     """
     Standard MCP endpoint for Streamable HTTP transport.
 
@@ -220,7 +269,21 @@ async def handle_mcp_endpoint(request: Request):
     """
     try:
         message = await request.json()
-        return await _handle_mcp_message(message)
+        return await _handle_mcp_message(message, credentials)
+    except AuthorizationError as e:
+        # Authorization errors should be handled with proper headers
+        return JSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "id": message.get("id") if "message" in locals() else None,
+                "error": {
+                    "code": -32603,
+                    "message": str(e.detail),
+                },
+            },
+            status_code=e.status_code,
+            headers=e.headers
+        )
     except Exception as e:
         sys.stderr.write(f"Error handling MCP message: {e}\n")
         return JSONResponse(
